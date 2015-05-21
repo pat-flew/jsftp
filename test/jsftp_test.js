@@ -17,44 +17,9 @@ var sinon = require("sinon");
 var EventEmitter = require("events").EventEmitter;
 var ftpServer = require("ftp-test-server");
 var rimraf = require("rimraf");
+var concat = require('concat-stream');
 
-var concat = function(bufs) {
-  var buffer, length = 0,
-    index = 0;
-
-  if (!Array.isArray(bufs))
-    bufs = Array.prototype.slice.call(arguments);
-
-  for (var i = 0, l = bufs.length; i < l; i++) {
-    buffer = bufs[i];
-    length += buffer.length;
-  }
-
-  buffer = new Buffer(length);
-
-  bufs.forEach(function(buf) {
-    buf.copy(buffer, index, 0, buf.length);
-    index += buf.length;
-  });
-
-  return buffer;
-};
-
-var concatStream = function(err, socket, callback) {
-  if (err) return callback(err);
-
-  var pieces = [];
-  socket.on("data", function(p) {
-    pieces.push(p);
-  });
-  socket.on("close", function(hadError) {
-    if (hadError)
-      return callback(new Error("Socket connection error"));
-
-    callback(null, concat(pieces));
-  });
-  socket.resume();
-};
+var dbgServer = require('debug')('jsftp:test:server');
 
 // Write down your system credentials. This test suite will use OSX internal
 // FTP server. If you want to test against a remote server, simply change the
@@ -78,34 +43,54 @@ var remoteCWD = "test/test_c9";
 exec('mkdir', [__dirname + "/" + remoteCWD]);
 
 describe("jsftp test suite", function() {
+  process.on('uncaughtException', function(err) {
+    console.log('Caught exception: ' + err);
+    server.stop();
+  });
+
   var ftp, server;
-  beforeEach(function(next) {
+  before(function(done) {
+    if (FTPCredentials.host === "localhost") {
+      server = new ftpServer();
+      server.init(FTPCredentials);
+
+      server.server.stdout.on('data', function(data) {
+        dbgServer(data.toString());
+      });
+
+      server.server.stderr.on('data', function(data) {
+        dbgServer(data.toString());
+      });
+
+      server.on('error', function(data) {
+        dbgServer(data.toString());
+      });
+    }
+    setTimeout(done, 1000);
+  });
+
+  beforeEach(function(done) {
     rimraf(getLocalPath(''), function() {
       Fs.mkdirSync(getLocalPath(''));
-      Fs.writeFileSync(getLocalPath('testfile.txt'), "test");
+      Fs.writeFileSync(getLocalPath('testfile.txt'), 'test');
+      Fs.writeFileSync(getLocalPath('testfile2.txt'), 'test2');
 
-      if (FTPCredentials.host === "localhost") {
-        server = new ftpServer();
-        server.init(FTPCredentials);
-      }
-
-      setTimeout(function() {
-        ftp = new Ftp(FTPCredentials);
-        next();
-      }, 100);
+      ftp = new Ftp(FTPCredentials);
+      ftp.once('connect', done);
     });
   });
 
-  afterEach(function(next) {
+  afterEach(function(done) {
     setTimeout(function() {
-      server.stop();
       if (ftp) {
         ftp.destroy();
         ftp = null;
       }
+      done();
     }, 50);
-    next();
   });
+
+  after(function() { server.stop(); });
 
   it("test initialize bad host", function(next) {
     var ftp2 = new Ftp({
@@ -127,11 +112,10 @@ describe("jsftp test suite", function() {
     assert.equal(ftp.user, FTPCredentials.user);
 
     assert.ok(ftp instanceof EventEmitter);
-    assert.equal(ftp.pending.length, 0);
-    assert.equal(ftp.cmdBuffer_.length, 0);
+    assert.equal(ftp.commandQueue.length, 0);
 
     next();
-  })
+  });
 
   it("test parseResponse with mark", function(next) {
     var cb = sinon.spy();
@@ -144,12 +128,12 @@ describe("jsftp test suite", function() {
       isMark: true
     };
 
-    ftp.cmdBuffer_ = [
-      ["retr fakefile.txt", cb]
+    ftp.commandQueue = [
+      { action:"retr fakefile.txt", callback: cb }
     ];
     ftp.parse = sinon.spy();
 
-    var firstCmd = ftp.cmdBuffer_[0];
+    var firstCmd = ftp.commandQueue[0];
     ftp.parseResponse(data);
     assert(ftp.parse.calledWith(data, firstCmd));
     next();
@@ -163,8 +147,8 @@ describe("jsftp test suite", function() {
       isMark: true
     };
 
-    ftp.cmdBuffer_ = [
-      ["retr fakefile.txt", cb]
+    ftp.commandQueue = [
+      { action: "retr fakefile.txt", callback: cb }
     ];
     ftp.parse = sinon.spy();
 
@@ -201,11 +185,9 @@ describe("jsftp test suite", function() {
       isMark: false
     };
 
-    ftp.cmdBuffer_ = [
-      ["retr fakefile.txt", cb],
-      ["list /",
-        function() {}
-      ]
+    ftp.commandQueue = [
+      { action: "retr fakefile.txt", callback: cb },
+      { action: "list /", callback: function() {} }
     ];
     ftp.parse = sinon.spy();
     ftp.ignoreCmdCode = 150;
@@ -218,6 +200,17 @@ describe("jsftp test suite", function() {
     next();
   });
 
+  it("test invalid password", function(next) {
+    ftp.auth(
+      FTPCredentials.user,
+      FTPCredentials.pass + '_invalid',
+      function(err, data) {
+        assert.equal(err.code, 530);
+        assert.equal(data, null);
+        next();
+      });
+  });
+
   it("test getFeatures", function(next) {
     ftp.getFeatures(function(err, feats) {
       assert.ok(Array.isArray(feats));
@@ -227,6 +220,10 @@ describe("jsftp test suite", function() {
       var feat = ftp.features[0];
       assert.ok(ftp.hasFeat(feat));
       assert.equal(false, ftp.hasFeat("madeup-feat"));
+      assert.equal(false, ftp.hasFeat());
+      assert.equal(false, ftp.hasFeat(null));
+      assert.equal(false, ftp.hasFeat(''));
+      assert.equal(false, ftp.hasFeat(0));
       next();
     });
   });
@@ -277,9 +274,17 @@ describe("jsftp test suite", function() {
     });
   });
 
+  it("test passive listing of nonexisting directory", function(next) {
+    ftp.list('does-not-exist/', function(err, res) {
+      assert.equal(typeof err, 'object');
+      assert.ok(err.code === 450 || err.code === 550);
+      next();
+    });
+  });
+
   it("test ftp node stat", function(next) {
     ftp.raw.pwd(function(err, res) {
-      var parent = /.*"(.*)".*/.exec(res.text)[1];
+      var parent = new RegExp('.*"(.*)".*').exec(res.text)[1];
       var path = Path.resolve(parent + "/" + remoteCWD);
       ftp.raw.stat(path, function(err, res) {
         assert.ok(!err, res);
@@ -339,6 +344,7 @@ describe("jsftp test suite", function() {
   });
 
   it("test save a remote copy of a local file", function(next) {
+    this.timeout(10000);
     var filePath = getRemotePath("file_ftp_test.txt");
     var onProgress = sinon.spy();
     ftp.on('progress', onProgress);
@@ -358,6 +364,16 @@ describe("jsftp test suite", function() {
           next();
         });
       });
+    });
+  });
+
+  it("test passing a dir instead of file path to put should callback with error", function (next) {
+      var localUploadPath = ".";
+      var remoteFileName  = "directory_file_upload_should_fail.txt";
+
+      ftp.put(localUploadPath, remoteFileName, function(hadError) {
+          assert.ok(hadError);
+          next();
     });
   });
 
@@ -534,13 +550,11 @@ describe("jsftp test suite", function() {
   });
 
   it("test reconnect", function(next) {
+    this.timeout(10000);
     ftp.raw.pwd(function(err, res) {
       if (err) throw err;
 
-      var code = parseInt(res.code, 10);
-      assert.ok(code === 257, "PWD command was not successful");
-
-      ftp.socket.end();
+      ftp.socket.destroy();
       ftp.raw.quit(function(err, res) {
         if (err) throw err;
         next();
@@ -614,11 +628,17 @@ describe("jsftp test suite", function() {
     var originalData = Fs.readFileSync(path);
     ftp.getGetSocket(getRemotePath("testfile.txt"), function(err, readable) {
       assert.ok(!err);
-      concatStream(err, readable, function(err, buffer) {
+      var concatStream = concat(function(buffer) {
         assert.ok(!err);
         assert.equal(buffer.toString(), originalData.toString());
         next();
       });
+
+      readable.on('error', function(err) {
+        throw new Error(err);
+      });
+
+      readable.pipe(concatStream);
     });
   });
 
@@ -639,13 +659,20 @@ describe("jsftp test suite", function() {
       assert.ok(!err);
       originalData.pipe(socket);
       originalData.resume();
-      concatStream(err, originalData, function(err, buffer) {
+
+      var concatStream = concat(function(buffer) {
         assert.ok(!err);
         Fs.readFile(path, "utf8", function(err, original) {
           assert.equal(buffer.toString("utf8"), original);
           next();
         });
       });
+
+      originalData.on('error', function(err) {
+        throw new Error(err);
+      });
+
+      originalData.pipe(concatStream);
     });
   });
 
@@ -680,6 +707,104 @@ describe("jsftp test suite", function() {
         assert.ok( !! err);
         processed += 1;
         if (processed === 2) next();
+      });
+    });
+  });
+
+  it("Test raw method with PWD", function(next) {
+    ftp.raw('pwd', function(err, res) {
+      assert(!err, err);
+
+      var code = parseInt(res.code, 10);
+      assert.ok(code === 257, "Raw PWD command was not successful: " + res.text);
+
+      next();
+    });
+  });
+
+  it("Test raw method with HELP", function(next) {
+    ftp.raw('help', function(err, res) {
+      assert(!err, err);
+
+      var code = parseInt(res.code, 10);
+      assert.ok(code === 214, "Raw HELP command was not successful: " + res.text);
+
+      next();
+    });
+  });
+
+  it("Test keep-alive with NOOP", function(next) {
+    this.timeout(10000);
+    ftp.keepAlive();
+    ftp.keepAlive(1000);
+    setTimeout(function() {
+      ftp.destroy();
+      next();
+    }, 5000);
+  });
+
+  it.skip("Test handling error on simultaneous PASV requests {#90}", function(next) {
+    var file1 = remoteCWD + "/testfile.txt";
+    var file2 = remoteCWD + "/testfile2.txt";
+
+    var counter = 0;
+    var args = [];
+    function onDone() {
+      counter += 1;
+      if (counter === 2) {
+        assert.ok(args.some(function(arg) { return arg instanceof Error; }));
+        next();
+      }
+    }
+
+    ftp.raw.pwd(function(err) {
+      assert.ok(!err);
+
+      ftp.get(file1, function() {
+        args.push(arguments[0]);
+        onDone();
+      });
+      ftp.get(file2, function() {
+        args.push(arguments[0]);
+        onDone();
+      });
+    });
+  });
+
+  it("test set binary type", function(next) {
+    ftp.setType('I', function(err, res) {
+      assert.ok(!err);
+      assert.equal(ftp.type, 'I');
+      assert.equal(res.code, 200);
+      ftp.setType('I', function(err, res) {
+        assert.ok(!err);
+        assert.ok(!res);
+        assert.equal(ftp.type, 'I');
+        ftp.setType('A', function(err, res) {
+          assert.ok(!err);
+          assert.equal(ftp.type, 'A');
+          assert.equal(res.code, 200);
+          next();
+        });
+      });
+    });
+  });
+
+  it('test listing a folder containing special UTF characters', function(next) {
+    var dirName = '_éàèùâêûô_';
+    var newDir = Path.join(remoteCWD, dirName);
+    ftp.raw.mkd(newDir, function(err, res) {
+      assert.ok(!err);
+      assert.equal(res.code, 257);
+      ftp.ls(remoteCWD, function(err, res) {
+        assert.ok(!err);
+        assert.ok(res.some(function(el) {
+          return el.name.indexOf(dirName) > -1;
+        }));
+        ftp.raw.rmd(newDir, function(err, res) {
+          assert.ok(!err);
+          next();
+        });
       });
     });
   });
